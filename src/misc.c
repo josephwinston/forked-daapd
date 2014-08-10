@@ -28,6 +28,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
 #include <limits.h>
@@ -443,6 +444,43 @@ unicode_fixup_string(char *str)
     }
 
   return (char *)ret;
+}
+
+char *
+trimwhitespace(const char *str)
+{
+  char *ptr;
+  char *start;
+  char *out;
+
+  if (!str)
+    return NULL;
+
+  // Find the beginning
+  while (isspace(*str))
+    str++;
+
+  if (*str == 0) // All spaces?
+    return strdup("");
+
+  // Make copy, because we will need to insert a null terminator
+  start = strdup(str);
+  if (!start)
+    return NULL;
+
+  // Find the end
+  ptr = start + strlen(start) - 1;
+  while (ptr > start && isspace(*ptr))
+    ptr--;
+
+  // Insert null terminator
+  *(ptr+1) = 0;
+
+  out = strdup(start);
+
+  free(start);
+
+  return out;
 }
 
 uint32_t
