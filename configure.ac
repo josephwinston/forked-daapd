@@ -116,6 +116,8 @@ PKG_CHECK_MODULES(ZLIB, [ zlib ])
 PKG_CHECK_MODULES(CONFUSE, [ libconfuse ])
 PKG_CHECK_MODULES(AVAHI, [ avahi-client >= 0.6.24 ])
 PKG_CHECK_MODULES(SQLITE3, [ sqlite3 >= 3.5.0 ])
+PKG_CHECK_MODULES(SSL, [ openssl ])
+PKG_CHECK_MODULES(LIBEVENT_SSL, [ libevent_openssl ])
 
 save_LIBS="$LIBS"
 LIBS="$SQLITE3_LIBS"
