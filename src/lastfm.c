@@ -36,25 +36,11 @@
 #else
 # include "evhttp/evhttp_compat.h"
 #endif
-
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include "evhttp/https_client.h"
 
 #include "lastfm.h"
 #include "logger.h"
 #include "misc.h"
-
-// For http_make_request
-#include <event2/bufferevent_ssl.h>
-#include <event2/bufferevent.h>
-#include <event2/buffer.h>
-#include <event2/listener.h>
-#include <event2/util.h>
-#include <event2/http.h>
-
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/rand.h>
 
 
 enum lastfm_state
@@ -121,252 +107,6 @@ const char *auth_url = "https://ws.audioscrobbler.com/2.0/";
 // Session key
 char *g_session_key;
 
-
-/* ------------------------------ HTTPS CLIENT ----------------------------- */
-/*           Also supports http. TODO: Host certificate validation           */
-
-static void
-https_request_cb(struct evhttp_request *req, void *ctx)
-{
-  struct evbuffer *input_buffer;
-  mxml_node_t *tree;
-  mxml_node_t *s_node;
-  mxml_node_t *e_node;
-  char buffer[256];
-  char *body;
-  char *errmsg;
-  char *sk;
-  int response_code;
-
-
-  if (req == NULL) {
-    /* If req is NULL, it means an error occurred, but
-     * sadly we are mostly left guessing what the error
-     * might have been.  We'll do our best... */
-    struct bufferevent *bev = (struct bufferevent *) ctx;
-    unsigned long oslerr;
-    int printed_err = 0;
-    int errcode = EVUTIL_SOCKET_ERROR();
-
-    DPRINTF(E_LOG, L_LASTFM, "Request failed\n");
-    /* Print out the OpenSSL error queue that libevent
-     * squirreled away for us, if any. */
-    while ((oslerr = bufferevent_get_openssl_error(bev))) {
-      ERR_error_string_n(oslerr, buffer, sizeof(buffer));
-      DPRINTF(E_LOG, L_LASTFM, "- error message: %s\n", buffer);
-      printed_err = 1;
-    }
-    /* If the OpenSSL error queue was empty, maybe it was a
-     * socket error; let's try printing that. */
-    if (! printed_err)
-      DPRINTF(E_LOG, L_LASTFM, "- socket error: %s (%d)\n", evutil_socket_error_to_string(errcode), errcode);
-    return;
-  }
-
-  // Load response content
-  input_buffer = evhttp_request_get_input_buffer(req);
-  evbuffer_add(input_buffer, "", 1); // NULL-terminate the buffer
-
-  body = (char *)evbuffer_pullup(input_buffer, -1);
-  if (!body || (strlen(body) == 0))
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Empty response\n");
-      return;
-    }
-
-  tree = mxmlLoadString(NULL, body, MXML_OPAQUE_CALLBACK);
-  if (!tree)
-    return;
-
-  // Look for errors
-  response_code = evhttp_request_get_response_code(req);
-  e_node = mxmlFindPath(tree, "lfm/error");
-  if (e_node)
-    {
-      errmsg = trimwhitespace(mxmlGetOpaque(e_node));
-      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): %s\n", response_code, errmsg);
-
-      if (errmsg)
-	free(errmsg);
-      mxmlDelete(tree);
-      return;
-    }
-  if (response_code != HTTP_OK)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): No LastFM error description\n", response_code);
-      mxmlDelete(tree);
-      return;
-    }
-
-  // Get the session key
-  s_node = mxmlFindPath(tree, "lfm/session/key");
-  if (!s_node)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Session key not found\n");
-      mxmlDelete(tree);
-      return;
-    }
-
-  sk = trimwhitespace(mxmlGetOpaque(s_node));
-  DPRINTF(E_LOG, L_LASTFM, "Got session key (%s) from LastFM\n", sk);
-
-  if (sk)
-    free(sk);
-  mxmlDelete(tree);
-}
-
-static int
-https_request(const char *url, const char *body, char **errmsg)
-{
-  struct event_base *base;
-  struct evhttp_uri *http_uri;
-  struct bufferevent *bev;
-  struct evhttp_connection *evcon;
-  struct evhttp_request *req;
-  struct evkeyvalq *output_headers;
-  struct evbuffer *output_buffer;
-  const char *scheme, *host, *path, *query;
-  char uri[256];
-  char content_len[8];
-  int port;
-  int r;
-  SSL_CTX *ssl_ctx;
-  SSL *ssl;
-
-  *errmsg = NULL;
-
-  http_uri = evhttp_uri_parse(url);
-  if (http_uri == NULL) {
-    *errmsg = "Malformed url";
-    return -1;
-  }
-
-  scheme = evhttp_uri_get_scheme(http_uri);
-  if (scheme == NULL || (strcasecmp(scheme, "https") != 0 &&
-                         strcasecmp(scheme, "http") != 0)) {
-    *errmsg = "URL must be http or https";
-    return -1;
-  }
-
-  host = evhttp_uri_get_host(http_uri);
-  if (host == NULL) {
-    *errmsg = "URL must have a host";
-    return -1;
-  }
-
-  port = evhttp_uri_get_port(http_uri);
-  if (port == -1) {
-    port = (strcasecmp(scheme, "http") == 0) ? 80 : 443;
-  }
-
-  path = evhttp_uri_get_path(http_uri);
-  if (path == NULL) {
-    path = "/";
-  }
-
-  query = evhttp_uri_get_query(http_uri);
-  if (query == NULL) {
-    snprintf(uri, sizeof(uri) - 1, "%s", path);
-  } else {
-    snprintf(uri, sizeof(uri) - 1, "%s?%s", path, query);
-  }
-  uri[sizeof(uri) - 1] = '\0';
-
-  // Initialize OpenSSL
-  SSL_library_init();
-  ERR_load_crypto_strings();
-  SSL_load_error_strings();
-  OpenSSL_add_all_algorithms();
-
-  /* Create a new OpenSSL context */
-  ssl_ctx = SSL_CTX_new(SSLv23_method());
-  if (!ssl_ctx) {
-    *errmsg = "Could not create SSL context";
-    return -1;
-  }
-
-  // Create event base
-  base = event_base_new();
-  if (!base) {
-    *errmsg = "Could not create event base";
-    return -1;
-  }
-
-  // Point global to the base
-  evbase_lastfm = base;
-
-  // Create OpenSSL bufferevent and stack evhttp on top of it
-  ssl = SSL_new(ssl_ctx);
-  if (ssl == NULL) {
-    *errmsg = "Could not create SSL bufferevent";
-    event_base_free(base);
-    return -1;
-  }
-
-  // Set hostname for SNI extension
-  SSL_set_tlsext_host_name(ssl, host);
-
-  if (strcasecmp(scheme, "http") == 0) {
-    bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
-  } else {
-    bev = bufferevent_openssl_socket_new(base, -1, ssl,
-      BUFFEREVENT_SSL_CONNECTING,
-      BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-  }
-
-  if (bev == NULL) {
-    *errmsg = "Could not create bufferevent";
-    event_base_free(base);
-    return -1;
-  }
-
-  bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
-
-  evcon = evhttp_connection_base_bufferevent_new(base, NULL, bev, host, port);
-  if (evcon == NULL) {
-    *errmsg = "Could not create evcon";
-    event_base_free(base);
-    return -1;
-  }
-
-  // Fire off the request
-  req = evhttp_request_new(https_request_cb, bev);
-  if (req == NULL) {
-    *errmsg = "Could not create request";
-    evhttp_connection_free(evcon);
-    event_base_free(base);
-    return -1;
-  }
-
-  output_headers = evhttp_request_get_output_headers(req);
-  evhttp_add_header(output_headers, "Host", host);
-  evhttp_add_header(output_headers, "Connection", "close");
-  evhttp_add_header(output_headers, "User-Agent", "forked-daapd");
-  evhttp_add_header(output_headers, "Accept-Charset", "utf-8");
-  evhttp_add_header(output_headers, "Content-Type", "application/x-www-form-urlencoded");
-
-  if (body) {
-    output_buffer = evhttp_request_get_output_buffer(req);
-    evbuffer_add(output_buffer, body, strlen(body));
-    snprintf(content_len, sizeof(content_len), "%d", strlen(body));
-    evhttp_add_header(output_headers, "Content-Length", content_len);
-  }
-
-  r = evhttp_make_request(evcon, req, body ? EVHTTP_REQ_POST : EVHTTP_REQ_GET, uri);
-  if (r != 0) {
-    *errmsg = "Could not make request";
-    evhttp_connection_free(evcon);
-    event_base_free(base);
-    return -1;
-  }
-
-  event_base_dispatch(base);
-
-  evhttp_connection_free(evcon);
-  event_base_free(base);
-
-  return 0;
-}
 
 
 /* --------------------------------- HELPERS ------------------------------- */
@@ -544,9 +284,88 @@ lastfm_sign(struct param_t **param)
   return ret;
 }
 
+static void
+lastfm_request_cb(struct evhttp_request *req, void *ctx)
+{
+  struct evbuffer *input_buffer;
+  mxml_node_t *tree;
+  mxml_node_t *s_node;
+  mxml_node_t *e_node;
+  char *body;
+  char *errmsg;
+  char *sk;
+  int response_code;
+
+  // TODO: Free evcon?
+
+  if (!req)
+    {
+      errmsg = https_client_get_error(ctx);
+      DPRINTF(E_LOG, L_LASTFM, "Request failed with error: %s\n", errmsg);
+      free(errmsg);
+      return;
+    }
+
+  // Load response content
+  input_buffer = evhttp_request_get_input_buffer(req);
+  evbuffer_add(input_buffer, "", 1); // NULL-terminate the buffer
+
+  body = (char *)evbuffer_pullup(input_buffer, -1);
+  if (!body || (strlen(body) == 0))
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Empty response\n");
+      return;
+    }
+
+  tree = mxmlLoadString(NULL, body, MXML_OPAQUE_CALLBACK);
+  if (!tree)
+    return;
+
+  // Look for errors
+  response_code = evhttp_request_get_response_code(req);
+  e_node = mxmlFindPath(tree, "lfm/error");
+  if (e_node)
+    {
+      errmsg = trimwhitespace(mxmlGetOpaque(e_node));
+      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): %s\n", response_code, errmsg);
+
+      if (errmsg)
+	free(errmsg);
+      mxmlDelete(tree);
+      return;
+    }
+  if (response_code != HTTP_OK)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): No LastFM error description\n", response_code);
+      mxmlDelete(tree);
+      return;
+    }
+
+  // Get the session key
+  s_node = mxmlFindPath(tree, "lfm/session/key");
+  if (!s_node)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Session key not found\n");
+      mxmlDelete(tree);
+      return;
+    }
+
+  sk = trimwhitespace(mxmlGetOpaque(s_node));
+  if (sk)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Got session key (%s) from LastFM\n", sk);
+      db_admin_add("lastfm_sk", sk);
+      free(sk);
+    }
+
+  mxmlDelete(tree);
+}
+
+
 static int
 lastfm_request_post(char *method, struct param_t **param, int auth)
 {
+  struct https_client_ctx ctx;
   char *errmsg;
   char *body;
   int ret;
@@ -583,11 +402,14 @@ lastfm_request_post(char *method, struct param_t **param, int auth)
 
   param_free(*param);
 
-  if (!auth)
-    ret = https_request(api_url, body, &errmsg);
-  else
-    ret = https_request(auth_url, body, &errmsg);
+  memset(&ctx, 0, sizeof(struct https_client_ctx));
+  ctx.evbase = evbase_lastfm;
+  ctx.url = auth ? auth_url : api_url;
+  ctx.body = body;
+  ctx.cb = lastfm_request_cb;
+  ctx.headers = NULL;
 
+  ret = https_client_request(&ctx, &errmsg);
   if (ret < 0)
     DPRINTF(E_LOG, L_LASTFM, "Request failed: %s\n", errmsg);
 
@@ -758,7 +580,16 @@ thread_exit(void)
 static void *
 lastfm(void *arg)
 {
+  int ret;
+
   DPRINTF(E_DBG, L_LASTFM, "Main loop initiating\n");
+
+  ret = db_perthread_init();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Error: DB init failed\n");
+      pthread_exit(NULL);
+    }
 
   g_state = LASTFM_STATE_ACTIVE;
 
@@ -769,6 +600,8 @@ lastfm(void *arg)
       DPRINTF(E_LOG, L_LASTFM, "lastfm event loop terminated ahead of time!\n");
       g_state = LASTFM_STATE_INACTIVE;
     }
+
+  db_perthread_deinit();
 
   DPRINTF(E_DBG, L_LASTFM, "Main loop terminating\n");
 
@@ -840,21 +673,23 @@ lastfm_login(char *path)
   char *password;
   int ret;
 
-//  db_lastfm_session_delete();
+  // Delete any existing session key
+  db_admin_delete("lastfm_sk");
 
   ret = lastfm_file_read(path, &username, &password);
   if (ret < 0)
     return;
 
   // Spawn thread
-//  lastfm_init();
+  lastfm_init();
 
   param = NULL;
   param_add(&param, "api_key", g_api_key);
   param_add(&param, "username", username);
   param_add(&param, "password", password);
 
-  // Send an authentication request and wait for callback
+  // TODO: Probably better to do this in the LastFM thread
+  // Send the authentication request and exit
   lastfm_request_post("auth.getMobileSession", &param, 1);
 }
 
@@ -877,8 +712,8 @@ lastfm_scrobble(struct media_file_info *mfi)
     return -1;
 
   // First time lastfm_scrobble is called the state will be LASTFM_UNKNOWN
-//  if (g_state == LASTFM_STATE_UNKNOWN)
-//    db_lastfm_session_get(&g_session_key);
+  if (g_state == LASTFM_STATE_UNKNOWN)
+    g_session_key = db_admin_get("lastfm_sk");
 
   if (!g_session_key)
     {
@@ -1015,12 +850,12 @@ lastfm_init(void)
   return -1;
 }
 
-static void
+/*static void
 lastfm_deinit(void)
 {
   int ret;
 
-  /* Send exit signal to thread (if active) */
+  // Send exit signal to thread (if active)
   if (g_state == LASTFM_STATE_ACTIVE)
     {
       thread_exit();
@@ -1033,12 +868,12 @@ lastfm_deinit(void)
 	}
     }
 
-  /* Free event base (should free events too) */
+  // Free event base (should free events too)
   event_base_free(evbase_lastfm);
 
-  /* Close pipes */
+  // Close pipes
   close(g_cmd_pipe[0]);
   close(g_cmd_pipe[1]);
   close(g_exit_pipe[0]);
   close(g_exit_pipe[1]);
-}
+}*/

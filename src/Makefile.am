@@ -2,27 +2,27 @@
 sbin_PROGRAMS = forked-daapd
 
 if COND_FLAC
-FLACSRC=scan-flac.c
+FLAC_SRC=scan-flac.c
 endif
 
 if COND_MUSEPACK
-MUSEPACKSRC=scan-mpc.c
+MUSEPACK_SRC=scan-mpc.c
 endif
 
 if COND_ITUNES
-ITUNESSRC=filescanner_itunes.c
+ITUNES_SRC=filescanner_itunes.c
 endif
 
 if COND_SPOTIFY
-SPOTIFYSRC=spotify.c spotify.h
+SPOTIFY_SRC=spotify.c spotify.h
 endif
 
 if COND_ALSA
-ALSASRC=laudio_alsa.c
+ALSA_SRC=laudio_alsa.c
 endif
 
 if COND_OSS4
-OSS4SRC=laudio_oss4.c
+OSS4_SRC=laudio_oss4.c
 endif
 
 if COND_AVIO
@@ -34,16 +34,19 @@ endif
 if COND_LIBEVENT1
 EVHTTP_SRC=evhttp/http.c evhttp/evhttp.h evhttp/evhttp_compat.c evhttp/evhttp_compat.h evhttp/http-internal.h evhttp/log.h
 RTSP_SRC=evrtsp/rtsp-libevent1.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h
+LASTFM_SRC=
 endif
 
 if COND_LIBEVENT20
 EVHTTP_SRC=
 RTSP_SRC=evrtsp/rtsp-libevent20.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h
+LASTFM_SRC=
 endif
 
 if COND_LIBEVENT21
-EVHTTP_SRC=
+EVHTTP_SRC=evhttp/https_client.c evhttp/https_client.h
 RTSP_SRC=evrtsp/rtsp.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h
+LASTFM_SRC=lastfm.c lastfm.h
 endif
 
 GPERF_FILES = \
@@ -93,7 +96,7 @@ forked_daapd_SOURCES = main.c \
 	logger.c logger.h \
 	conffile.c conffile.h \
 	filescanner.c filescanner.h \
-	filescanner_ffmpeg.c filescanner_m3u.c filescanner_icy.c $(ITUNESSRC) \
+	filescanner_ffmpeg.c filescanner_m3u.c filescanner_icy.c $(ITUNES_SRC) \
 	mdns_avahi.c mdns.h \
 	remote_pairing.c remote_pairing.h \
 	$(EVHTTP_SRC) \
@@ -111,13 +114,13 @@ forked_daapd_SOURCES = main.c \
 	rsp_query.c rsp_query.h \
 	daap_query.c daap_query.h \
 	player.c player.h \
-	lastfm.c lastfm.h \
-	$(ALSASRC) $(OSS4SRC) laudio.h \
+	$(ALSA_SRC) $(OSS4_SRC) laudio.h \
 	raop.c raop.h \
 	$(RTSP_SRC) \
 	scan-wma.c \
-	$(SPOTIFYSRC) \
-	$(FLACSRC) $(MUSEPACKSRC)
+	$(SPOTIFY_SRC) \
+	$(LASTFM_SRC) \
+	$(FLAC_SRC) $(MUSEPACK_SRC)
 
 nodist_forked_daapd_SOURCES = \
 	$(ANTLR_SOURCES)
