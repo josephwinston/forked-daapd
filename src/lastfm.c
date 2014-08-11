@@ -30,12 +30,10 @@
 
 #include <gcrypt.h>
 #include <mxml.h>
-#include <event.h>
-#if defined HAVE_LIBEVENT2
-# include <event2/http.h>
-#else
-# include "evhttp/evhttp_compat.h"
-#endif
+#include <event2/event.h>
+#include <event2/buffer.h>
+#include <event2/http.h>
+
 #include "evhttp/https_client.h"
 
 #include "lastfm.h"
@@ -71,13 +69,6 @@ struct lastfm_command
   int ret;
 };
 
-struct param_t {
-  char *key;
-  char *val;
-  struct param_t *next;
-  struct param_t *tmp;
-};
-
 
 /* --- Globals --- */
 // lastfm thread
@@ -102,7 +93,6 @@ const char *g_secret = "ce45a1d275c10b3edf0ecfa27791cb2b";
 
 const char *api_url = "http://ws.audioscrobbler.com/2.0/";
 const char *auth_url = "https://ws.audioscrobbler.com/2.0/";
-//const char *auth_url = "http://192.168.1.1/";
 
 // Session key
 char *g_session_key;
@@ -111,88 +101,25 @@ char *g_session_key;
 
 /* --------------------------------- HELPERS ------------------------------- */
 
-static int
-param_add(struct param_t **param, const char *key, const char *val)
-{
-  struct param_t *new;
-
-  new = (struct param_t *)malloc(sizeof(struct param_t));
-  if (!new)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Out of memory adding new parameter: %s\n", key);
-      return -1;
-    }
-
-  new->key  = strdup(key);
-  new->val  = strdup(val);
-  new->next = *param;
-
-  *param = new;
-
-  return 0;
-}
-
-static void
-param_sort(struct param_t **param)
-{
-  struct param_t *sorted;
-  struct param_t *p;
-  struct param_t *s;
-
-  sorted = *param;
-  for (p = *param; p != NULL; p = p->next)
-    {
-//      DPRINTF(E_DBG, L_LASTFM, "Finding next for %s\n", p->key);
-      p->tmp = NULL;
-      for (s = *param; s != NULL; s = s->next)
-	{
-	  // We try to find a key in param which is greater than p->key
-	  // but less than our current candidate (p->tmp->key)
-	  if ( (strcmp(s->key, p->key) > 0) &&
-	       ((p->tmp == NULL) || (strcmp(s->key, p->tmp->key) < 0)) )
-	    p->tmp = s;
-	}
-/*if (p->tmp)
-      DPRINTF(E_DBG, L_LASTFM, "Next for %s is %s\n", p->key, p->tmp->key);
-else
-      DPRINTF(E_DBG, L_LASTFM, "No next for %s\n", p->key);
-*/
-      // Find smallest key, which will be the new head
-      if (strcmp(p->key, sorted->key) < 0)
-	sorted = p;
-    }
-
-//  DPRINTF(E_DBG, L_LASTFM, "Setting new next\n");
-  while ((p = *param))
-    {
-      *param  = p->next;
-      p->next = p->tmp;
-    }
-
-//  DPRINTF(E_DBG, L_LASTFM, "Setting param\n");
-  *param = sorted;
-
-//  DPRINTF(E_DBG, L_LASTFM, "Sorted request param: %s\n", sorted->key);
-}
 
 /* Converts parameters to a string in application/x-www-form-urlencoded format */
 static int
-param_print(char **body, struct param_t *param)
+body_print(char **body, struct keyval *kv)
 {
   struct evbuffer *evbuf;
-  struct param_t *p;
+  struct onekeyval *okv;
   char *k;
   char *v;
 
   evbuf = evbuffer_new();
 
-  for (p = param; p != NULL; p = p->next)
+  for (okv = kv->head; okv; okv = okv->next)
     {
-      k = evhttp_encode_uri(p->key);
+      k = evhttp_encode_uri(okv->name);
       if (!k)
         continue;
 
-      v = evhttp_encode_uri(p->val);
+      v = evhttp_encode_uri(okv->value);
       if (!v)
 	{
 	  free(k);
@@ -202,7 +129,7 @@ param_print(char **body, struct param_t *param)
       evbuffer_add(evbuf, k, strlen(k));
       evbuffer_add(evbuf, "=", 1);
       evbuffer_add(evbuf, v, strlen(v));
-      if (p->next)
+      if (okv->next)
 	evbuffer_add(evbuf, "&", 1);
 
       free(k);
@@ -220,25 +147,11 @@ param_print(char **body, struct param_t *param)
   return 0;
 }
 
-static void
-param_free(struct param_t *param)
-{
-  struct param_t *p;
-
-  while ((p = param))
-    {
-      param = p->next;
-      free(p->key);
-      free(p->val);
-      free(p);
-    }
-}
-
 /* Creates an md5 signature of the concatenated parameters and adds it to param */
 static int
-lastfm_sign(struct param_t **param)
+lastfm_sign(struct keyval *kv)
 {
-  struct param_t *p;
+  struct onekeyval *okv;
 
   char hash[33];
   char ebuf[64];
@@ -257,10 +170,10 @@ lastfm_sign(struct param_t **param)
       return -1;
     }
 
-  for (p = *param; p != NULL; p = p->next)
+  for (okv = kv->head; okv; okv = okv->next)
     {
-      gcry_md_write(md_hdl, p->key, strlen(p->key));
-      gcry_md_write(md_hdl, p->val, strlen(p->val));
+      gcry_md_write(md_hdl, okv->name, strlen(okv->name));
+      gcry_md_write(md_hdl, okv->value, strlen(okv->value));
     }  
 
   gcry_md_write(md_hdl, g_secret, strlen(g_secret));
@@ -277,7 +190,7 @@ lastfm_sign(struct param_t **param)
   for (i = 0; i < hash_len; i++)
     sprintf(hash + (2 * i), "%02x", hash_bytes[i]);
 
-  ret = param_add(param, "api_sig", hash);
+  ret = keyval_add(kv, "api_sig", hash);
 
   gcry_md_close(md_hdl);
 
@@ -363,25 +276,25 @@ lastfm_request_cb(struct evhttp_request *req, void *ctx)
 
 
 static int
-lastfm_request_post(char *method, struct param_t **param, int auth)
+lastfm_request_post(char *method, struct keyval *kv, int auth)
 {
   struct https_client_ctx ctx;
   char *errmsg;
   char *body;
   int ret;
 
-  ret = param_add(param, "method", method);
+  ret = keyval_add(kv, "method", method);
   if (ret < 0)
     return -1;
 
   if (!auth)
-    ret = param_add(param, "sk", g_session_key);
+    ret = keyval_add(kv, "sk", g_session_key);
   if (ret < 0)
     return -1;
 
   // API requires that we MD5 sign sorted param (without "format" param)
-  param_sort(param);
-  ret = lastfm_sign(param);
+  keyval_sort(kv);
+  ret = lastfm_sign(kv);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_LASTFM, "Aborting request, lastfm_sign failed\n");
@@ -389,18 +302,16 @@ lastfm_request_post(char *method, struct param_t **param, int auth)
     }
 
   if (!auth)
-    param_add(param, "format", "json");
+    keyval_add(kv, "format", "json");
   if (ret < 0)
     return -1;
 
-  ret = param_print(&body, *param);
+  ret = body_print(&body, kv);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_LASTFM, "Aborting request, param_print failed\n");
       return -1;
     }
-
-  param_free(*param);
 
   memset(&ctx, 0, sizeof(struct https_client_ctx));
   ctx.evbase = evbase_lastfm;
@@ -668,7 +579,7 @@ lastfm_init(void);
 void
 lastfm_login(char *path)
 {
-  struct param_t *param;
+  struct keyval *kv;
   char *username;
   char *password;
   int ret;
@@ -683,14 +594,25 @@ lastfm_login(char *path)
   // Spawn thread
   lastfm_init();
 
-  param = NULL;
-  param_add(&param, "api_key", g_api_key);
-  param_add(&param, "username", username);
-  param_add(&param, "password", password);
+  kv = keyval_alloc();
+  if (!kv)
+    return;
+
+  ret = ( (keyval_add(kv, "api_key", g_api_key) == 0) &&
+          (keyval_add(kv, "username", username) == 0) &&
+          (keyval_add(kv, "password", password) == 0) );
+
+  if (!ret)
+    {
+      keyval_clear(kv);
+      return;
+    }
 
   // TODO: Probably better to do this in the LastFM thread
   // Send the authentication request and exit
-  lastfm_request_post("auth.getMobileSession", &param, 1);
+  lastfm_request_post("auth.getMobileSession", kv, 1);
+
+  keyval_clear(kv);
 }
 
 /* Thread: http and player */
