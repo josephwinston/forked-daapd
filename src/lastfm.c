@@ -21,10 +21,12 @@
 #endif
 
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <string.h>
 #include <pthread.h>
 
@@ -36,17 +38,11 @@
 
 #include "evhttp/https_client.h"
 
+#include "db.h"
 #include "lastfm.h"
 #include "logger.h"
 #include "misc.h"
 
-
-enum lastfm_state
-{
-  LASTFM_STATE_UNKNOWN,
-  LASTFM_STATE_INACTIVE,
-  LASTFM_STATE_ACTIVE,
-};
 
 struct lastfm_command;
 
@@ -63,7 +59,8 @@ struct lastfm_command
 
   union {
     void *noarg;
-    struct media_file_info mfi;
+    int id;
+    struct keyval *kv;
   } arg;
 
   int ret;
@@ -81,8 +78,12 @@ static int g_cmd_pipe[2];
 static struct event *g_exitev;
 static struct event *g_cmdev;
 
-// The global state telling us what the thread is currently doing
-static enum lastfm_state g_state = LASTFM_STATE_UNKNOWN;
+// Tells us if the LastFM thread has been set up
+static int g_initialized = 0;
+
+// LastFM becomes disabled if we get a scrobble, try initialising session,
+// but can't (probably no session key in db because user does not use LastFM)
+static int g_disabled = 0;
 
 /**
  * The API key and secret (not so secret being open source) is specific to 
@@ -95,246 +96,15 @@ const char *api_url = "http://ws.audioscrobbler.com/2.0/";
 const char *auth_url = "https://ws.audioscrobbler.com/2.0/";
 
 // Session key
-char *g_session_key;
+char *g_session_key = NULL;
 
 
 
 /* --------------------------------- HELPERS ------------------------------- */
 
-
-/* Converts parameters to a string in application/x-www-form-urlencoded format */
+/* Reads a LastFM credentials file (1st line username, 2nd line password) */
 static int
-body_print(char **body, struct keyval *kv)
-{
-  struct evbuffer *evbuf;
-  struct onekeyval *okv;
-  char *k;
-  char *v;
-
-  evbuf = evbuffer_new();
-
-  for (okv = kv->head; okv; okv = okv->next)
-    {
-      k = evhttp_encode_uri(okv->name);
-      if (!k)
-        continue;
-
-      v = evhttp_encode_uri(okv->value);
-      if (!v)
-	{
-	  free(k);
-	  continue;
-	}
-
-      evbuffer_add(evbuf, k, strlen(k));
-      evbuffer_add(evbuf, "=", 1);
-      evbuffer_add(evbuf, v, strlen(v));
-      if (okv->next)
-	evbuffer_add(evbuf, "&", 1);
-
-      free(k);
-      free(v);
-    }
-
-  evbuffer_add(evbuf, "\n", 1);
-
-  *body = evbuffer_readln(evbuf, NULL, EVBUFFER_EOL_ANY);
-
-  evbuffer_free(evbuf);
-
-  DPRINTF(E_DBG, L_LASTFM, "Parameters in request are: %s\n", *body);
-
-  return 0;
-}
-
-/* Creates an md5 signature of the concatenated parameters and adds it to param */
-static int
-lastfm_sign(struct keyval *kv)
-{
-  struct onekeyval *okv;
-
-  char hash[33];
-  char ebuf[64];
-  uint8_t *hash_bytes;
-  size_t hash_len;
-  gcry_md_hd_t md_hdl;
-  gpg_error_t gc_err;
-  int ret;
-  int i;
-
-  gc_err = gcry_md_open(&md_hdl, GCRY_MD_MD5, 0);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_LASTFM, "Could not open MD5: %s\n", ebuf);
-      return -1;
-    }
-
-  for (okv = kv->head; okv; okv = okv->next)
-    {
-      gcry_md_write(md_hdl, okv->name, strlen(okv->name));
-      gcry_md_write(md_hdl, okv->value, strlen(okv->value));
-    }  
-
-  gcry_md_write(md_hdl, g_secret, strlen(g_secret));
-
-  hash_bytes = gcry_md_read(md_hdl, GCRY_MD_MD5);
-  if (!hash_bytes)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Could not read MD5 hash\n");
-      return -1;
-    }
-
-  hash_len = gcry_md_get_algo_dlen(GCRY_MD_MD5);
-
-  for (i = 0; i < hash_len; i++)
-    sprintf(hash + (2 * i), "%02x", hash_bytes[i]);
-
-  ret = keyval_add(kv, "api_sig", hash);
-
-  gcry_md_close(md_hdl);
-
-  return ret;
-}
-
-static void
-lastfm_request_cb(struct evhttp_request *req, void *ctx)
-{
-  struct evbuffer *input_buffer;
-  mxml_node_t *tree;
-  mxml_node_t *s_node;
-  mxml_node_t *e_node;
-  char *body;
-  char *errmsg;
-  char *sk;
-  int response_code;
-
-  // TODO: Free evcon?
-
-  if (!req)
-    {
-      errmsg = https_client_get_error(ctx);
-      DPRINTF(E_LOG, L_LASTFM, "Request failed with error: %s\n", errmsg);
-      free(errmsg);
-      return;
-    }
-
-  // Load response content
-  input_buffer = evhttp_request_get_input_buffer(req);
-  evbuffer_add(input_buffer, "", 1); // NULL-terminate the buffer
-
-  body = (char *)evbuffer_pullup(input_buffer, -1);
-  if (!body || (strlen(body) == 0))
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Empty response\n");
-      return;
-    }
-
-  tree = mxmlLoadString(NULL, body, MXML_OPAQUE_CALLBACK);
-  if (!tree)
-    return;
-
-  // Look for errors
-  response_code = evhttp_request_get_response_code(req);
-  e_node = mxmlFindPath(tree, "lfm/error");
-  if (e_node)
-    {
-      errmsg = trimwhitespace(mxmlGetOpaque(e_node));
-      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): %s\n", response_code, errmsg);
-
-      if (errmsg)
-	free(errmsg);
-      mxmlDelete(tree);
-      return;
-    }
-  if (response_code != HTTP_OK)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): No LastFM error description\n", response_code);
-      mxmlDelete(tree);
-      return;
-    }
-
-  // Get the session key
-  s_node = mxmlFindPath(tree, "lfm/session/key");
-  if (!s_node)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Session key not found\n");
-      mxmlDelete(tree);
-      return;
-    }
-
-  sk = trimwhitespace(mxmlGetOpaque(s_node));
-  if (sk)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Got session key (%s) from LastFM\n", sk);
-      db_admin_add("lastfm_sk", sk);
-      free(sk);
-    }
-
-  mxmlDelete(tree);
-}
-
-
-static int
-lastfm_request_post(char *method, struct keyval *kv, int auth)
-{
-  struct https_client_ctx ctx;
-  char *errmsg;
-  char *body;
-  int ret;
-
-  ret = keyval_add(kv, "method", method);
-  if (ret < 0)
-    return -1;
-
-  if (!auth)
-    ret = keyval_add(kv, "sk", g_session_key);
-  if (ret < 0)
-    return -1;
-
-  // API requires that we MD5 sign sorted param (without "format" param)
-  keyval_sort(kv);
-  ret = lastfm_sign(kv);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Aborting request, lastfm_sign failed\n");
-      return -1;
-    }
-
-  if (!auth)
-    keyval_add(kv, "format", "json");
-  if (ret < 0)
-    return -1;
-
-  ret = body_print(&body, kv);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Aborting request, param_print failed\n");
-      return -1;
-    }
-
-  memset(&ctx, 0, sizeof(struct https_client_ctx));
-  ctx.evbase = evbase_lastfm;
-  ctx.url = auth ? auth_url : api_url;
-  ctx.body = body;
-  ctx.cb = lastfm_request_cb;
-  ctx.headers = NULL;
-
-  ret = https_client_request(&ctx, &errmsg);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_LASTFM, "Request failed: %s\n", errmsg);
-
-  return ret;
-}
-
-static int
-scrobble(struct lastfm_command *cmd)
-{
-  return 0;
-}
-
-static int
-lastfm_file_read(char *path, char **username, char **password)
+credentials_read(char *path, char **username, char **password)
 {
   FILE *fp;
   char *u;
@@ -435,6 +205,101 @@ lastfm_file_read(char *path, char **username, char **password)
   return 0;
 }
 
+/* Converts parameters to a string in application/x-www-form-urlencoded format */
+static int
+body_print(char **body, struct keyval *kv)
+{
+  struct evbuffer *evbuf;
+  struct onekeyval *okv;
+  char *k;
+  char *v;
+
+  evbuf = evbuffer_new();
+
+  for (okv = kv->head; okv; okv = okv->next)
+    {
+      k = evhttp_encode_uri(okv->name);
+      if (!k)
+        continue;
+
+      v = evhttp_encode_uri(okv->value);
+      if (!v)
+	{
+	  free(k);
+	  continue;
+	}
+
+      evbuffer_add(evbuf, k, strlen(k));
+      evbuffer_add(evbuf, "=", 1);
+      evbuffer_add(evbuf, v, strlen(v));
+      if (okv->next)
+	evbuffer_add(evbuf, "&", 1);
+
+      free(k);
+      free(v);
+    }
+
+  evbuffer_add(evbuf, "\n", 1);
+
+  *body = evbuffer_readln(evbuf, NULL, EVBUFFER_EOL_ANY);
+
+  evbuffer_free(evbuf);
+
+  DPRINTF(E_DBG, L_LASTFM, "Parameters in request are: %s\n", *body);
+
+  return 0;
+}
+
+/* Creates an md5 signature of the concatenated parameters and adds it to keyval */
+static int
+param_sign(struct keyval *kv)
+{
+  struct onekeyval *okv;
+
+  char hash[33];
+  char ebuf[64];
+  uint8_t *hash_bytes;
+  size_t hash_len;
+  gcry_md_hd_t md_hdl;
+  gpg_error_t gc_err;
+  int ret;
+  int i;
+
+  gc_err = gcry_md_open(&md_hdl, GCRY_MD_MD5, 0);
+  if (gc_err != GPG_ERR_NO_ERROR)
+    {
+      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
+      DPRINTF(E_LOG, L_LASTFM, "Could not open MD5: %s\n", ebuf);
+      return -1;
+    }
+
+  for (okv = kv->head; okv; okv = okv->next)
+    {
+      gcry_md_write(md_hdl, okv->name, strlen(okv->name));
+      gcry_md_write(md_hdl, okv->value, strlen(okv->value));
+    }  
+
+  gcry_md_write(md_hdl, g_secret, strlen(g_secret));
+
+  hash_bytes = gcry_md_read(md_hdl, GCRY_MD_MD5);
+  if (!hash_bytes)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Could not read MD5 hash\n");
+      return -1;
+    }
+
+  hash_len = gcry_md_get_algo_dlen(GCRY_MD_MD5);
+
+  for (i = 0; i < hash_len; i++)
+    sprintf(hash + (2 * i), "%02x", hash_bytes[i]);
+
+  ret = keyval_add(kv, "api_sig", hash);
+
+  gcry_md_close(md_hdl);
+
+  return ret;
+}
+
 
 /* ---------------------------- COMMAND EXECUTION -------------------------- */
 
@@ -485,8 +350,220 @@ thread_exit(void)
 
 
 
-/* ------------------------------- MAIN LOOP ------------------------------- */
+/* --------------------------------- MAIN --------------------------------- */
 /*                              Thread: lastfm                              */
+
+static void
+request_cb(struct evhttp_request *req, void *ctx)
+{
+  struct evbuffer *input_buffer;
+  mxml_node_t *tree;
+  mxml_node_t *s_node;
+  mxml_node_t *e_node;
+  char *body;
+  char *errmsg;
+  char *sk;
+  int response_code;
+
+  // TODO: Free evcon?
+
+  if (!req)
+    {
+      errmsg = https_client_get_error(ctx);
+      DPRINTF(E_LOG, L_LASTFM, "Request failed with error: %s\n", errmsg);
+      free(errmsg);
+      return;
+    }
+
+  // Load response content
+  input_buffer = evhttp_request_get_input_buffer(req);
+  evbuffer_add(input_buffer, "", 1); // NULL-terminate the buffer
+
+  body = (char *)evbuffer_pullup(input_buffer, -1);
+  if (!body || (strlen(body) == 0))
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Empty response\n");
+      return;
+    }
+
+  DPRINTF(E_SPAM, L_LASTFM, "LastFM response:\n%s\n", body);
+
+  tree = mxmlLoadString(NULL, body, MXML_OPAQUE_CALLBACK);
+  if (!tree)
+    return;
+
+  // Look for errors
+  response_code = evhttp_request_get_response_code(req);
+  e_node = mxmlFindPath(tree, "lfm/error");
+  if (e_node)
+    {
+      errmsg = trimwhitespace(mxmlGetOpaque(e_node));
+      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): %s\n", response_code, errmsg);
+
+      if (errmsg)
+	free(errmsg);
+      mxmlDelete(tree);
+      return;
+    }
+  if (response_code != HTTP_OK)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): No LastFM error description\n", response_code);
+      mxmlDelete(tree);
+      return;
+    }
+
+  // Was it a scrobble request? Then do nothing. TODO: Check for error messages
+  s_node = mxmlFindPath(tree, "lfm/scrobbles");
+  if (s_node)
+    {
+      DPRINTF(E_DBG, L_LASTFM, "Scrobble callback\n");
+      mxmlDelete(tree);
+      return;
+    }
+
+  // Otherwise an auth request, so get the session key
+  s_node = mxmlFindPath(tree, "lfm/session/key");
+  if (!s_node)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Session key not found\n");
+      mxmlDelete(tree);
+      return;
+    }
+
+  sk = trimwhitespace(mxmlGetOpaque(s_node));
+  if (sk)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Got session key (%s) from LastFM\n", sk);
+      db_admin_add("lastfm_sk", sk);
+
+      if (g_session_key)
+	free(g_session_key);
+
+      g_session_key = sk;
+    }
+
+  mxmlDelete(tree);
+}
+
+static int
+request_post(char *method, struct keyval *kv, int auth)
+{
+  struct https_client_ctx ctx;
+  char *errmsg;
+  char *body;
+  int ret;
+
+  ret = keyval_add(kv, "method", method);
+  if (ret < 0)
+    return -1;
+
+  if (!auth)
+    ret = keyval_add(kv, "sk", g_session_key);
+  if (ret < 0)
+    return -1;
+
+  // API requires that we MD5 sign sorted param (without "format" param)
+  keyval_sort(kv);
+  ret = param_sign(kv);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Aborting request, param_sign failed\n");
+      return -1;
+    }
+
+  ret = body_print(&body, kv);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Aborting request, body_print failed\n");
+      return -1;
+    }
+
+  memset(&ctx, 0, sizeof(struct https_client_ctx));
+  ctx.evbase = evbase_lastfm;
+  ctx.url = auth ? auth_url : api_url;
+  ctx.body = body;
+  ctx.cb = request_cb;
+  ctx.headers = NULL;
+
+  ret = https_client_request(&ctx, &errmsg);
+  if (ret < 0)
+    DPRINTF(E_LOG, L_LASTFM, "Request failed: %s\n", errmsg);
+
+  return ret;
+}
+
+static int
+login(struct lastfm_command *cmd)
+{
+  request_post("auth.getMobileSession", cmd->arg.kv, 1);
+
+  keyval_clear(cmd->arg.kv);
+
+  return 0;
+}
+
+static int
+scrobble(struct lastfm_command *cmd)
+{
+  struct media_file_info *mfi;
+  struct keyval *kv;
+  char duration[4];
+  char trackNumber[4];
+  char timestamp[16];
+  int ret;
+
+  mfi = db_file_fetch_byid(cmd->arg.id);
+  if (!mfi)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Scrobble failed, track id %d is unknown\n", cmd->arg.id);
+      return -1;
+    }
+
+  // Don't scrobble songs which are shorter than 30 sec
+  if (mfi->song_length < 30000)
+    return -1;
+
+  // Don't scrobble songs with unknown artist
+  if (strcmp(mfi->artist, "Unknown artist") == 0)
+    return -1;
+
+  kv = keyval_alloc();
+  if (!kv)
+    return -1;
+
+  snprintf(duration, sizeof(duration), "%" PRIu32, mfi->song_length);
+  snprintf(trackNumber, sizeof(trackNumber), "%" PRIu32, mfi->track);
+  snprintf(timestamp, sizeof(timestamp), "%" PRIi64, (int64_t)time(NULL));
+
+  ret = ( (keyval_add(kv, "api_key", g_api_key) == 0) &&
+          (keyval_add(kv, "sk", g_session_key) == 0) &&
+          (keyval_add(kv, "artist", mfi->artist) == 0) &&
+          (keyval_add(kv, "track", mfi->title) == 0) &&
+          (keyval_add(kv, "album", mfi->album) == 0) &&
+          (keyval_add(kv, "albumArtist", mfi->album_artist) == 0) &&
+          (keyval_add(kv, "duration", duration) == 0) &&
+          (keyval_add(kv, "trackNumber", trackNumber) == 0) &&
+          (keyval_add(kv, "timestamp", timestamp) == 0)
+        );
+
+  free_mfi(mfi, 0);
+
+  if (!ret)
+    {
+      keyval_clear(kv);
+      return -1;
+    }
+
+  DPRINTF(E_INFO, L_LASTFM, "Scrobbling '%s' by '%s'\n", keyval_get(kv, "track"), keyval_get(kv, "artist"));
+
+  request_post("track.scrobble", kv, 0);
+
+  keyval_clear(kv);
+
+  return 0;
+}
+
+
 
 static void *
 lastfm(void *arg)
@@ -502,14 +579,12 @@ lastfm(void *arg)
       pthread_exit(NULL);
     }
 
-  g_state = LASTFM_STATE_ACTIVE;
-
   event_base_dispatch(evbase_lastfm);
 
-  if (g_state != LASTFM_STATE_INACTIVE)
+  if (g_initialized)
     {
-      DPRINTF(E_LOG, L_LASTFM, "lastfm event loop terminated ahead of time!\n");
-      g_state = LASTFM_STATE_INACTIVE;
+      DPRINTF(E_LOG, L_LASTFM, "LastFM event loop terminated ahead of time!\n");
+      g_initialized = 0;
     }
 
   db_perthread_deinit();
@@ -531,7 +606,7 @@ exit_cb(int fd, short what, void *arg)
 
   event_base_loopbreak(evbase_lastfm);
 
-  g_state = LASTFM_STATE_INACTIVE;
+  g_initialized = 0;
 
   event_add(g_exitev, NULL);
 }
@@ -579,17 +654,29 @@ lastfm_init(void);
 void
 lastfm_login(char *path)
 {
+  struct lastfm_command *cmd;
   struct keyval *kv;
   char *username;
   char *password;
   int ret;
 
+  DPRINTF(E_DBG, L_LASTFM, "Got LastFM login request\n");
+
   // Delete any existing session key
+  if (g_session_key)
+    free(g_session_key);
+
+  g_session_key = NULL;
+
   db_admin_delete("lastfm_sk");
 
-  ret = lastfm_file_read(path, &username, &password);
+  // Read the credentials file
+  ret = credentials_read(path, &username, &password);
   if (ret < 0)
     return;
+
+  // Enable LastFM now that we got a login attempt
+  g_disabled = 0;
 
   // Spawn thread
   lastfm_init();
@@ -602,45 +689,51 @@ lastfm_login(char *path)
           (keyval_add(kv, "username", username) == 0) &&
           (keyval_add(kv, "password", password) == 0) );
 
+  free(username);
+  free(password);
+
   if (!ret)
     {
       keyval_clear(kv);
       return;
     }
 
-  // TODO: Probably better to do this in the LastFM thread
-  // Send the authentication request and exit
-  lastfm_request_post("auth.getMobileSession", kv, 1);
+  // Send login command to the thread
+  cmd = (struct lastfm_command *)malloc(sizeof(struct lastfm_command));
+  if (!cmd)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Could not allocate lastfm_command\n");
+      return;
+    }
 
-  keyval_clear(kv);
+  memset(cmd, 0, sizeof(struct lastfm_command));
+
+  cmd->nonblock = 1;
+  cmd->func = login;
+  cmd->arg.kv = kv;
+
+  nonblock_command(cmd);
+
+  return;
 }
 
 /* Thread: http and player */
 int
-lastfm_scrobble(struct media_file_info *mfi)
+lastfm_scrobble(int id)
 {
   struct lastfm_command *cmd;
 
-  // User is not using LastFM (no valid session key is available)
-  if (g_state == LASTFM_STATE_INACTIVE)
+  DPRINTF(E_DBG, L_LASTFM, "Got LastFM scrobble request\n");
+
+  // LastFM is disabled because we already tried looking for a session key, but failed
+  if (g_disabled)
     return -1;
 
-  // Don't scrobble songs which are shorter than 30 sec
-  if (mfi->song_length < 30000)
-    return -1;
-
-  // Don't scrobble songs with unknown artist
-  if (strcmp(mfi->artist, "Unknown artist") == 0)
-    return -1;
-
-  // First time lastfm_scrobble is called the state will be LASTFM_UNKNOWN
-  if (g_state == LASTFM_STATE_UNKNOWN)
-    g_session_key = db_admin_get("lastfm_sk");
-
-  if (!g_session_key)
+  // No session key in mem or in db
+  if ((!g_session_key) || !(g_session_key = db_admin_get("lastfm_sk")))
     {
       DPRINTF(E_INFO, L_LASTFM, "No valid LastFM session key\n");
-      g_state = LASTFM_STATE_INACTIVE;
+      g_disabled = 1;
       return -1;
     }
 
@@ -648,8 +741,6 @@ lastfm_scrobble(struct media_file_info *mfi)
   lastfm_init();
 
   // Send scrobble command to the thread
-  DPRINTF(E_DBG, L_LASTFM, "LastFM scrobble request\n");
-
   cmd = (struct lastfm_command *)malloc(sizeof(struct lastfm_command));
   if (!cmd)
     {
@@ -660,9 +751,8 @@ lastfm_scrobble(struct media_file_info *mfi)
   memset(cmd, 0, sizeof(struct lastfm_command));
 
   cmd->nonblock = 1;
-
   cmd->func = scrobble;
-  cmd->arg.mfi.artist = strdup(mfi->artist);
+  cmd->arg.id = id;
 
   nonblock_command(cmd);
 
@@ -674,8 +764,10 @@ lastfm_init(void)
 {
   int ret;
 
-  if (g_state == LASTFM_STATE_ACTIVE)
+  if (g_initialized)
     return -1;
+  else
+    g_initialized = 1;
 
 # if defined(__linux__)
   ret = pipe2(g_exit_pipe, O_CLOEXEC);

@@ -402,7 +402,7 @@ keyval_clear(struct keyval *kv)
   struct onekeyval *okv;
 
   if (!kv)
-    return NULL;
+    return;
 
   hokv = kv->head;
 
@@ -432,7 +432,6 @@ keyval_sort(struct keyval *kv)
   head = kv->head;
   for (okv = kv->head; okv; okv = okv->next)
     {
-//      DPRINTF(E_DBG, L_LASTFM, "Finding next for %s\n", p->key);
       okv->sort = NULL;
       for (sokv = kv->head; sokv; sokv = sokv->next)
 	{
@@ -442,29 +441,23 @@ keyval_sort(struct keyval *kv)
 	       ((okv->sort == NULL) || (strcmp(sokv->name, okv->sort->name) < 0)) )
 	    okv->sort = sokv;
 	}
-/*if (p->tmp)
-      DPRINTF(E_DBG, L_LASTFM, "Next for %s is %s\n", p->key, p->tmp->key);
-else
-      DPRINTF(E_DBG, L_LASTFM, "No next for %s\n", p->key);
-*/
+
       // Find smallest name, which will be the new head
       if (strcmp(okv->name, head->name) < 0)
 	head = okv;
     }
 
-//  DPRINTF(E_DBG, L_LASTFM, "Setting new next\n");
   while ((okv = kv->head))
     {
       kv->head  = okv->next;
       okv->next = okv->sort;
     }
 
-//  DPRINTF(E_DBG, L_LASTFM, "Setting param\n");
   kv->head = head;
   for (okv = kv->head; okv; okv = okv->next)
     kv->tail = okv;
 
-  DPRINTF(E_DBG, L_MISC, "Sorted request param: h %s t %s\n", kv->head->name, kv->tail->name);
+  DPRINTF(E_DBG, L_MISC, "Keyval sorted. New head: %s. New tail: %s.\n", kv->head->name, kv->tail->name);
 }
 
 

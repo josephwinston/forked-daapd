@@ -57,6 +57,7 @@
 #include "player.h"
 #include "raop.h"
 #include "laudio.h"
+#include "lastfm.h"
 
 /* These handle getting the media data */
 #include "transcode.h"
@@ -1437,6 +1438,7 @@ source_check(void)
       i++;
 
       db_file_inc_playcount((int)cur_playing->id);
+      lastfm_scrobble((int)cur_playing->id);
 
       /* Stop playback if:
        * - at end of playlist (NULL)
