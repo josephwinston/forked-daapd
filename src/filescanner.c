@@ -62,7 +62,10 @@
 #include "misc.h"
 #include "remote_pairing.h"
 #include "player.h"
-#include "lastfm.h"
+
+#ifdef LASTFM
+# include "lastfm.h"
+#endif
 
 #ifdef HAVE_SPOTIFY_H
 # include "spotify.h"
@@ -683,12 +686,15 @@ process_file(char *file, time_t mtime, off_t size, int type, int flags)
 
 	  return;
 	}
+#ifdef LASTFM
       else if (strcmp(ext, ".lastfm") == 0)
 	{
 	  lastfm_login(file);
 
+
 	  return;
 	}
+#endif
 #ifdef HAVE_SPOTIFY_H
       else if (strcmp(ext, ".spotify") == 0)
 	{

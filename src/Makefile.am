@@ -17,6 +17,10 @@ if COND_SPOTIFY
 SPOTIFY_SRC=spotify.c spotify.h
 endif
 
+if COND_LASTFM
+SPOTIFY_SRC=lastfm.c lastfm.h
+endif
+
 if COND_ALSA
 ALSA_SRC=laudio_alsa.c
 endif
@@ -34,19 +38,16 @@ endif
 if COND_LIBEVENT1
 EVHTTP_SRC=evhttp/http.c evhttp/evhttp.h evhttp/evhttp_compat.c evhttp/evhttp_compat.h evhttp/http-internal.h evhttp/log.h
 RTSP_SRC=evrtsp/rtsp-libevent1.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h
-LASTFM_SRC=
 endif
 
 if COND_LIBEVENT20
 EVHTTP_SRC=
 RTSP_SRC=evrtsp/rtsp-libevent20.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h
-LASTFM_SRC=
 endif
 
 if COND_LIBEVENT21
-EVHTTP_SRC=evhttp/https_client.c evhttp/https_client.h
+EVHTTP_SRC=
 RTSP_SRC=evrtsp/rtsp.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h
-LASTFM_SRC=lastfm.c lastfm.h
 endif
 
 GPERF_FILES = \
@@ -82,14 +83,14 @@ forked_daapd_CFLAGS = \
 	@ZLIB_CFLAGS@ @AVAHI_CFLAGS@ @SQLITE3_CFLAGS@ @LIBAV_CFLAGS@ \
 	@CONFUSE_CFLAGS@ @TAGLIB_CFLAGS@ @MINIXML_CFLAGS@ @LIBPLIST_CFLAGS@ \
 	@LIBGCRYPT_CFLAGS@ @GPG_ERROR_CFLAGS@ @ALSA_CFLAGS@ @SPOTIFY_CFLAGS@ \
-	@SSL_CFLAGS@ @LIBEVENT_SSL_CFLAGS@
+	@LIBCURL_CFLAGS@
 
 forked_daapd_LDADD = -lrt \
 	@ZLIB_LIBS@ @AVAHI_LIBS@ @SQLITE3_LIBS@ @LIBAV_LIBS@ \
 	@CONFUSE_LIBS@ @FLAC_LIBS@ @TAGLIB_LIBS@ @LIBEVENT_LIBS@ \
 	@LIBAVL_LIBS@ @MINIXML_LIBS@ @ANTLR3C_LIBS@ @LIBPLIST_LIBS@ \
 	@LIBGCRYPT_LIBS@ @GPG_ERROR_LIBS@ @ALSA_LIBS@ @LIBUNISTRING@ @SPOTIFY_LIBS@ \
-	@SSL_LIBS@ @LIBEVENT_SSL_LIBS@
+	@LIBCURL_LIBS@
 
 forked_daapd_SOURCES = main.c \
 	db.c db.h \

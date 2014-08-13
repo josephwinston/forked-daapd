@@ -36,7 +36,7 @@
 #include <event2/buffer.h>
 #include <event2/http.h>
 
-#include "evhttp/https_client.h"
+#include <curl/curl.h>
 
 #include "db.h"
 #include "lastfm.h"
@@ -64,6 +64,13 @@ struct lastfm_command
   } arg;
 
   int ret;
+};
+
+struct https_client_ctx
+{
+  const char *url;
+  const char *body;
+  struct evbuffer *data;
 };
 
 
@@ -353,61 +360,61 @@ thread_exit(void)
 /* --------------------------------- MAIN --------------------------------- */
 /*                              Thread: lastfm                              */
 
-static void
-request_cb(struct evhttp_request *req, void *ctx)
+static size_t
+request_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
-  struct evbuffer *input_buffer;
+  size_t realsize;
+  struct https_client_ctx *ctx;
+  int ret;
+
+  realsize = size * nmemb;
+  ctx = (struct https_client_ctx *)userdata;
+
+  ret = evbuffer_add(ctx->data, ptr, realsize);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Error adding reply from LastFM to data buffer\n");
+      return 0;
+    }
+
+  return realsize;
+}
+
+static void
+response_proces(struct https_client_ctx *ctx)
+{
   mxml_node_t *tree;
   mxml_node_t *s_node;
   mxml_node_t *e_node;
   char *body;
   char *errmsg;
   char *sk;
-  int response_code;
 
-  // TODO: Free evcon?
+  // NULL-terminate the buffer
+  evbuffer_add(ctx->data, "", 1);
 
-  if (!req)
-    {
-      errmsg = https_client_get_error(ctx);
-      DPRINTF(E_LOG, L_LASTFM, "Request failed with error: %s\n", errmsg);
-      free(errmsg);
-      return;
-    }
-
-  // Load response content
-  input_buffer = evhttp_request_get_input_buffer(req);
-  evbuffer_add(input_buffer, "", 1); // NULL-terminate the buffer
-
-  body = (char *)evbuffer_pullup(input_buffer, -1);
+  body = (char *)evbuffer_pullup(ctx->data, -1);
   if (!body || (strlen(body) == 0))
     {
       DPRINTF(E_LOG, L_LASTFM, "Empty response\n");
       return;
     }
 
-  DPRINTF(E_SPAM, L_LASTFM, "LastFM response:\n%s\n", body);
+  DPRINTF(E_DBG, L_LASTFM, "LastFM response:\n%s\n", body);
 
   tree = mxmlLoadString(NULL, body, MXML_OPAQUE_CALLBACK);
   if (!tree)
     return;
 
   // Look for errors
-  response_code = evhttp_request_get_response_code(req);
   e_node = mxmlFindPath(tree, "lfm/error");
   if (e_node)
     {
       errmsg = trimwhitespace(mxmlGetOpaque(e_node));
-      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): %s\n", response_code, errmsg);
+      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed: %s\n", errmsg);
 
       if (errmsg)
 	free(errmsg);
-      mxmlDelete(tree);
-      return;
-    }
-  if (response_code != HTTP_OK)
-    {
-      DPRINTF(E_LOG, L_LASTFM, "Request to LastFM failed (HTTP error %d): No LastFM error description\n", response_code);
       mxmlDelete(tree);
       return;
     }
@@ -433,7 +440,7 @@ request_cb(struct evhttp_request *req, void *ctx)
   sk = trimwhitespace(mxmlGetOpaque(s_node));
   if (sk)
     {
-      DPRINTF(E_LOG, L_LASTFM, "Got session key (%s) from LastFM\n", sk);
+      DPRINTF(E_LOG, L_LASTFM, "Got session key from LastFM: %s\n", sk);
       db_admin_add("lastfm_sk", sk);
 
       if (g_session_key)
@@ -445,11 +452,58 @@ request_cb(struct evhttp_request *req, void *ctx)
   mxmlDelete(tree);
 }
 
+// We use libcurl to make the request. We could use libevent and avoid the
+// dependency, but for SSL, libevent needs to be v2.1 or better, which is still
+// a bit too new to be in the major distros
+static int
+https_client_request(struct https_client_ctx *ctx)
+{
+  CURL *curl;
+  CURLcode res;
+ 
+  curl = curl_easy_init();
+  if (!curl)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Error: Could not get curl handle\n");
+      return -1;
+    }
+
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "libcurl-agent/1.0");
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, ctx->body);
+  curl_easy_setopt(curl, CURLOPT_URL, ctx->url);
+
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, request_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, ctx);
+
+  ctx->data = evbuffer_new();
+  if (!ctx->data)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Could not create evbuffer for LastFM response\n");
+      curl_easy_cleanup(curl);
+      return -1;
+    }
+
+  res = curl_easy_perform(curl);
+  if (res != CURLE_OK)
+    {
+      DPRINTF(E_LOG, L_LASTFM, "Request to %s failed: %s\n", ctx->url, curl_easy_strerror(res));
+      curl_easy_cleanup(curl);
+      return -1;
+    }
+
+  response_proces(ctx);
+
+  evbuffer_free(ctx->data);
+ 
+  curl_easy_cleanup(curl);
+
+  return 0;
+}
+
 static int
 request_post(char *method, struct keyval *kv, int auth)
 {
   struct https_client_ctx ctx;
-  char *errmsg;
   char *body;
   int ret;
 
@@ -479,15 +533,10 @@ request_post(char *method, struct keyval *kv, int auth)
     }
 
   memset(&ctx, 0, sizeof(struct https_client_ctx));
-  ctx.evbase = evbase_lastfm;
   ctx.url = auth ? auth_url : api_url;
   ctx.body = body;
-  ctx.cb = request_cb;
-  ctx.headers = NULL;
 
-  ret = https_client_request(&ctx, &errmsg);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_LASTFM, "Request failed: %s\n", errmsg);
+  ret = https_client_request(&ctx);
 
   return ret;
 }
@@ -679,7 +728,13 @@ lastfm_login(char *path)
   g_disabled = 0;
 
   // Spawn thread
-  lastfm_init();
+  ret = lastfm_init();
+  if (ret < 0)
+    {
+      g_disabled = 1;
+      return;
+    }
+  g_initialized = 1;
 
   kv = keyval_alloc();
   if (!kv)
@@ -722,6 +777,7 @@ int
 lastfm_scrobble(int id)
 {
   struct lastfm_command *cmd;
+  int ret;
 
   DPRINTF(E_DBG, L_LASTFM, "Got LastFM scrobble request\n");
 
@@ -738,7 +794,13 @@ lastfm_scrobble(int id)
     }
 
   // Spawn LastFM thread
-  lastfm_init();
+  ret = lastfm_init();
+  if (ret < 0)
+    {
+      g_disabled = 1;
+      return -1;
+    }
+  g_initialized = 1;
 
   // Send scrobble command to the thread
   cmd = (struct lastfm_command *)malloc(sizeof(struct lastfm_command));
@@ -765,9 +827,9 @@ lastfm_init(void)
   int ret;
 
   if (g_initialized)
-    return -1;
-  else
-    g_initialized = 1;
+    return 0;
+
+  curl_global_init(CURL_GLOBAL_DEFAULT);
 
 # if defined(__linux__)
   ret = pipe2(g_exit_pipe, O_CLOEXEC);
@@ -864,22 +926,23 @@ lastfm_init(void)
   return -1;
 }
 
-/*static void
+void
 lastfm_deinit(void)
 {
   int ret;
 
-  // Send exit signal to thread (if active)
-  if (g_state == LASTFM_STATE_ACTIVE)
-    {
-      thread_exit();
+  if (!g_initialized)
+    return;
 
-      ret = pthread_join(tid_lastfm, NULL);
-      if (ret != 0)
-	{
-	  DPRINTF(E_FATAL, L_LASTFM, "Could not join lastfm thread: %s\n", strerror(errno));
-	  return;
-	}
+  curl_global_cleanup();
+
+  thread_exit();
+
+  ret = pthread_join(tid_lastfm, NULL);
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_LASTFM, "Could not join lastfm thread: %s\n", strerror(errno));
+      return;
     }
 
   // Free event base (should free events too)
@@ -890,4 +953,4 @@ lastfm_deinit(void)
   close(g_cmd_pipe[1]);
   close(g_exit_pipe[0]);
   close(g_exit_pipe[1]);
-}*/
+}
