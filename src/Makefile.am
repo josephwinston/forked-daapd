@@ -18,7 +18,7 @@ SPOTIFY_SRC=spotify.c spotify.h
 endif
 
 if COND_LASTFM
-SPOTIFY_SRC=lastfm.c lastfm.h
+LASTFM_SRC=lastfm.c lastfm.h
 endif
 
 if COND_ALSA
@@ -119,8 +119,7 @@ forked_daapd_SOURCES = main.c \
 	raop.c raop.h \
 	$(RTSP_SRC) \
 	scan-wma.c \
-	$(SPOTIFY_SRC) \
-	$(LASTFM_SRC) \
+	$(SPOTIFY_SRC) $(LASTFM_SRC) \
 	$(FLAC_SRC) $(MUSEPACK_SRC)
 
 nodist_forked_daapd_SOURCES = \
