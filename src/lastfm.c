@@ -590,6 +590,10 @@ scrobble(struct lastfm_command *cmd)
   if (mfi->song_length < 30000)
     return -1;
 
+  // Don't scrobble non-music and radio stations
+  if ((mfi->media_kind != 1) || (mfi->data_kind == 1))
+    return -1;
+
   // Don't scrobble songs with unknown artist
   if (strcmp(mfi->artist, "Unknown artist") == 0)
     return -1;
