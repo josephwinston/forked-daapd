@@ -228,6 +228,8 @@ fi
 
 if test x$use_lastfm = xtrue; then
 	PKG_CHECK_MODULES(LIBCURL, [ libcurl ])
+	AC_CHECK_LIB([mxml], [mxmlGetOpaque],
+		AC_DEFINE(HAVE_MXML_GETOPAQUE, 1, [Define to 1 if your mxml has mxmlGetOpaque.]))
 fi
 
 case "$host" in

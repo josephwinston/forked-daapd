@@ -307,6 +307,24 @@ param_sign(struct keyval *kv)
   return ret;
 }
 
+/* For compability with mxml 2.6 */
+#ifndef HAVE_MXML_GETOPAQUE
+const char *				/* O - Opaque string or NULL */
+mxmlGetOpaque(mxml_node_t *node)	/* I - Node to get */
+{
+  if (!node)
+    return (NULL);
+
+  if (node->type == MXML_OPAQUE)
+    return (node->value.opaque);
+  else if (node->type == MXML_ELEMENT &&
+           node->child &&
+	   node->child->type == MXML_OPAQUE)
+    return (node->child->value.opaque);
+  else
+    return (NULL);
+}
+#endif
 
 /* ---------------------------- COMMAND EXECUTION -------------------------- */
 
@@ -407,7 +425,7 @@ response_proces(struct https_client_ctx *ctx)
     return;
 
   // Look for errors
-  e_node = mxmlFindPath(tree, "lfm/error");
+  e_node = mxmlFindElement(tree, tree, "error", NULL, NULL, MXML_DESCEND);
   if (e_node)
     {
       errmsg = trimwhitespace(mxmlGetOpaque(e_node));
@@ -420,7 +438,7 @@ response_proces(struct https_client_ctx *ctx)
     }
 
   // Was it a scrobble request? Then do nothing. TODO: Check for error messages
-  s_node = mxmlFindPath(tree, "lfm/scrobbles");
+  s_node = mxmlFindElement(tree, tree, "scrobbles", NULL, NULL, MXML_DESCEND);
   if (s_node)
     {
       DPRINTF(E_DBG, L_LASTFM, "Scrobble callback\n");
@@ -429,7 +447,7 @@ response_proces(struct https_client_ctx *ctx)
     }
 
   // Otherwise an auth request, so get the session key
-  s_node = mxmlFindPath(tree, "lfm/session/key");
+  s_node = mxmlFindElement(tree, tree, "key", NULL, NULL, MXML_DESCEND);
   if (!s_node)
     {
       DPRINTF(E_LOG, L_LASTFM, "Session key not found\n");
